@@ -175,4 +175,4 @@ async def generate_excel(request: ReportRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# 啟動方式 (在終端機): uvicorn api:app --reload
+# 啟動方式 (在終端機): uvicorn api:app--reload
