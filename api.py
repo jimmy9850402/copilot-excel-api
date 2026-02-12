@@ -4,6 +4,7 @@ import pandas as pd
 import io
 import re
 import base64
+from datetime import datetime
 
 app = FastAPI()
 
@@ -27,6 +28,7 @@ def parse_copilot_final(text):
     lines = text.split('\n')
     current_row = []
     
+    # 定義關鍵字
     fin_start_keywords = ["財務指標表", "項目", "最新季"]
     fin_item_keywords = ["營業收入", "總資產", "負債比", "流動資產", "流動負債", "現金流", "EPS"]
 
@@ -34,20 +36,22 @@ def parse_copilot_final(text):
         line = clean_text(line)
         if not line: continue
         
-        # 區塊偵測
+        # --- A. 區塊切換偵測 ---
         if "Pre-check List" in line:
             section = "pre_check"; current_row = []; continue
         elif any(k in line for k in fin_start_keywords) and "財務指標" in line:
             section = "finance"; current_row = []; continue
         elif "非財務條件" in line:
             section = "group_a"; current_row = []; continue
-        elif "Group A 判定" in line or "財務評分" in line or "綜合建議" in line:
+        # 偵測大標題 (例如 3️⃣ 財務評分, 4️⃣ 重大事件, 5️⃣ 總結)
+        elif any(marker in line for marker in ["3️⃣", "4️⃣", "5️⃣", "【Group A", "【核保结论", "【風險評級"]):
             section = "other"
             other.append(("header", line, ""))
             continue
 
-        # 填入邏輯
+        # --- B. 內容填入邏輯 ---
         try:
+            # 1. Pre-check
             if section == "pre_check":
                 if "項次" in line or "檢核項目" in line: continue
                 if line.isdigit() and len(line) < 3:
@@ -60,6 +64,7 @@ def parse_copilot_final(text):
                     if len(current_row) <= target_idx: current_row.append(line)
                     else: current_row[2] += f"\n{line}"
 
+            # 2. Finance
             elif section == "finance":
                 if "最新季" in line or "去年同期" in line: continue
                 is_new_item = any(k in line for k in fin_item_keywords) or (not any(c.isdigit() for c in line) and len(line) < 10)
@@ -71,6 +76,7 @@ def parse_copilot_final(text):
                 elif current_row and any(c.isdigit() for c in line):
                     if len(current_row) < 5: current_row.append(line)
 
+            # 3. Group A
             elif section == "group_a":
                 if "項次" in line or "項目" in line: continue
                 if line.isdigit() and len(line) < 3:
@@ -83,34 +89,55 @@ def parse_copilot_final(text):
                     if len(current_row) <= target_idx: current_row.append(line)
                     else: current_row[2] += f"\n{line}"
 
-            else: # Other
-                if "：" in line: parts = line.split("：", 1); other.append(("kv", parts[0], parts[1]))
-                elif "=" in line: parts = line.split("=", 1); other.append(("kv", parts[0].strip(), parts[1].strip()))
-                else: other.append(("full", line, ""))
-        except Exception:
-            continue # 如果這一行解析失敗，跳過就好，不要崩潰
+            # 4. Other (這裡做了大幅增強)
+            else:
+                # 處理子標題 (一) (二)
+                if line.startswith("(") and ")" in line and len(line) < 15:
+                    other.append(("subheader", line, ""))
+                
+                # 處理條列式 (-)
+                elif line.startswith("- "):
+                    other.append(("full", line, ""))
 
-    # 處理剩餘
+                # 處理 Key-Value (冒號, 等號, 約等於)
+                elif "：" in line: 
+                    parts = line.split("：", 1)
+                    other.append(("kv", parts[0], parts[1]))
+                elif "≈" in line: 
+                    parts = line.split("≈", 1)
+                    # 保留 ≈ 符號在數值端，看起來比較清楚
+                    other.append(("kv", parts[0].strip(), "≈ " + parts[1].strip()))
+                elif "=" in line: 
+                    parts = line.split("=", 1)
+                    other.append(("kv", parts[0].strip(), parts[1].strip()))
+                
+                # 處理其他純文字
+                else:
+                    other.append(("full", line, ""))
+
+        except Exception:
+            continue 
+
+    # 結尾補齊
     if section == "pre_check" and current_row: pre_check.append(current_row + [""]*(3-len(current_row)))
     elif section == "finance" and current_row: finance.append(current_row + [""]*(5-len(current_row)))
     elif section == "group_a" and current_row: group_a.append(current_row + [""]*(3-len(current_row)))
 
     return pre_check, finance, group_a, other
 
-# --- 3. API 接口 (含強力防錯) ---
+# --- 3. API 接口 ---
 @app.post("/generate_excel")
 async def generate_excel(request: ReportRequest):
     try:
-        # A. 防呆檢查
+        # A. 防呆
         if not request.text:
-            # 如果沒有文字，回傳一個空的 Excel，避免報錯
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                writer.book.add_worksheet("Error_No_Text")
+                writer.book.add_worksheet("Error")
             buffer.seek(0)
-            return {"filename": "Error_No_Data.xlsx", "file_content_base64": base64.b64encode(buffer.read()).decode('utf-8')}
+            return {"filename": "Error_No_Text.xlsx", "file_content_base64": base64.b64encode(buffer.read()).decode('utf-8')}
 
-        # B. 解析文字
+        # B. 解析
         pre, fin, grp, oth = parse_copilot_final(request.text)
         
         # C. 製作 Excel
@@ -122,6 +149,7 @@ async def generate_excel(request: ReportRequest):
             
             # 定義樣式
             header_fmt = workbook.add_format({'bold': True, 'fg_color': '#0070C0', 'font_color': 'white', 'border': 1, 'align': 'center', 'valign': 'vcenter'})
+            subheader_fmt = workbook.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1, 'align': 'left'}) # 淺藍色子標題
             cell_fmt = workbook.add_format({'border': 1, 'text_wrap': True, 'valign': 'top', 'align': 'left'})
             num_fmt = workbook.add_format({'border': 1, 'align': 'right', 'valign': 'vcenter'})
             section_fmt = workbook.add_format({'bold': True, 'fg_color': '#E0E0E0', 'border': 1})
@@ -130,12 +158,10 @@ async def generate_excel(request: ReportRequest):
 
             curr = 0
             
-            # Helper function: 安全寫入，避免當機
+            # Helper
             def safe_write(row, col, value, fmt):
-                try:
-                    worksheet.write(row, col, str(value), fmt)
-                except:
-                    pass
+                try: worksheet.write(row, col, str(value), fmt)
+                except: pass
 
             # 1. Pre-check
             if pre:
@@ -181,7 +207,7 @@ async def generate_excel(request: ReportRequest):
                     curr += 1
                 except: curr += 1
             
-            # 4. Other (最容易出錯的地方，加強保護)
+            # 4. Other (強化的寫入邏輯)
             if oth:
                 for item_type, key, value in oth:
                     try:
@@ -189,10 +215,14 @@ async def generate_excel(request: ReportRequest):
                         value = str(value) if value else ""
 
                         if item_type == "header": 
-                            # 嘗試合併，失敗則退回普通寫入
                             try: worksheet.merge_range(curr, 0, curr, 4, key, section_fmt)
                             except: worksheet.write(curr, 0, key, section_fmt)
                         
+                        elif item_type == "subheader": 
+                            # 淺藍色子標題
+                            try: worksheet.merge_range(curr, 0, curr, 4, key, subheader_fmt)
+                            except: worksheet.write(curr, 0, key, subheader_fmt)
+
                         elif item_type == "full": 
                             try: worksheet.merge_range(curr, 0, curr, 4, key, full_text_fmt)
                             except: worksheet.write(curr, 0, key, full_text_fmt)
@@ -203,44 +233,37 @@ async def generate_excel(request: ReportRequest):
                             except: worksheet.write(curr, 1, value, formula_val_fmt)
                         
                         curr += 1
-                    except Exception as e:
-                        # 如果這行真的沒救了，印出 Log 但不讓程式掛掉
-                        print(f"Skipping row due to error: {e}")
+                    except Exception:
                         curr += 1
 
             # 設定欄寬
-            worksheet.set_column('A:A', 20)
+            worksheet.set_column('A:A', 25) # 稍微加寬 A 欄以容納長項目
             worksheet.set_column('B:B', 30)
             worksheet.set_column('C:E', 15)
 
-        # D. 轉成 Base64
+        # D. 轉成 Base64 & 檔名處理 (含時間戳記)
         buffer.seek(0)
         file_base64 = base64.b64encode(buffer.read()).decode('utf-8')
         
-        # 確保檔名安全
-        safe_filename = re.sub(r'[\\/*?:"<>|]', "", request.company_name)
-        if not safe_filename: safe_filename = "Report"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_company = re.sub(r'[\\/*?:"<>|]', "", request.company_name)
+        if not safe_company: safe_company = "Report"
+        
+        final_filename = f"{safe_company}_{timestamp}.xlsx"
 
         return {
-            "filename": f"{safe_filename}_Report.xlsx",
+            "filename": final_filename,
             "file_content_base64": file_base64
         }
 
     except Exception as e:
-        # 捕捉所有未知錯誤，回傳 200 但帶有錯誤訊息的 Excel，而不是 502
-        print(f"CRITICAL ERROR: {str(e)}")
-        
-        # 嘗試回傳一個錯誤報告 Excel
+        # Error Fallback
         try:
             err_buffer = io.BytesIO()
             with pd.ExcelWriter(err_buffer, engine='xlsxwriter') as writer:
-                wb = writer.book
-                ws = wb.add_worksheet("Error_Log")
-                ws.write(0, 0, "System Error Occurred")
-                ws.write(1, 0, str(e))
+                ws = writer.book.add_worksheet("Error")
+                ws.write(0, 0, str(e))
             err_buffer.seek(0)
-            err_b64 = base64.b64encode(err_buffer.read()).decode('utf-8')
-            return {"filename": "Error_Log.xlsx", "file_content_base64": err_b64}
+            return {"filename": "Error_Log.xlsx", "file_content_base64": base64.b64encode(err_buffer.read()).decode('utf-8')}
         except:
-            # 真的沒救了才丟 500
-            raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
