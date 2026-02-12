@@ -30,6 +30,8 @@ def parse_copilot_final(text):
     
     # 定義關鍵字
     fin_start_keywords = ["財務指標表", "項目", "最新季"]
+    
+    # 這是舊邏輯用的，新邏輯主要靠 | 判斷
     fin_item_keywords = ["營業收入", "總資產", "負債比", "流動資產", "流動負債", "現金流", "EPS"]
 
     for line in lines:
@@ -43,7 +45,6 @@ def parse_copilot_final(text):
             section = "finance"; current_row = []; continue
         elif "非財務條件" in line:
             section = "group_a"; current_row = []; continue
-        # 偵測大標題
         elif any(marker in line for marker in ["3️⃣", "4️⃣", "5️⃣", "【Group A", "【核保結論", "【風險評級", "總結"]):
             section = "other"
             other.append(("header", line, ""))
@@ -53,20 +54,39 @@ def parse_copilot_final(text):
         try:
             # 1. Pre-check
             if section == "pre_check":
-                if "項次" in line or "檢核項目" in line: continue
-                if line.isdigit() and len(line) < 3:
-                    if current_row: 
-                        while len(current_row) < 3: current_row.append("")
-                        pre_check.append(current_row)
-                    current_row = [line]
-                elif current_row:
-                    target_idx = 1 if len(current_row) == 1 else 2
-                    if len(current_row) <= target_idx: current_row.append(line)
-                    else: current_row[2] += f"\n{line}"
+                if "項次" in line or "檢核項目" in line or "---" in line: continue
+                # 嘗試處理表格格式 | 1 | 項目 | 結果 |
+                if "|" in line:
+                    parts = [p.strip() for p in line.split('|') if p.strip()]
+                    if len(parts) >= 2: pre_check.append(parts[:3])
+                else:
+                    # 舊有的條列式解析
+                    if line.isdigit() and len(line) < 3:
+                        if current_row: 
+                            while len(current_row) < 3: current_row.append("")
+                            pre_check.append(current_row)
+                        current_row = [line]
+                    elif current_row:
+                        target_idx = 1 if len(current_row) == 1 else 2
+                        if len(current_row) <= target_idx: current_row.append(line)
+                        else: current_row[2] += f"\n{line}"
 
-            # 2. Finance
+            # 2. Finance (這裡做了重大修正！)
             elif section == "finance":
-                if "最新季" in line or "去年同期" in line: continue
+                if "最新季" in line or "去年同期" in line or "---" in line: continue
+                
+                # ★★★ 新增：優先檢查是否為 Markdown 表格 (有 | 符號)
+                if "|" in line:
+                    # 拆分並過濾空白
+                    parts = [p.strip() for p in line.split('|') if p.strip()]
+                    # 如果切出來有東西，就直接當作一行資料存進去
+                    if len(parts) > 1:
+                        # 確保長度補齊到 5 欄 (項目, 最新, 去年, 前一, 前二)
+                        while len(parts) < 5: parts.append("")
+                        finance.append(parts[:5]) # 只取前5個，避免格式跑掉
+                    continue
+
+                # 舊邏輯 (防呆用，處理沒用表格的情況)
                 is_new_item = any(k in line for k in fin_item_keywords) or (not any(c.isdigit() for c in line) and len(line) < 10)
                 if is_new_item:
                     if current_row:
@@ -78,33 +98,30 @@ def parse_copilot_final(text):
 
             # 3. Group A
             elif section == "group_a":
-                if "項次" in line or "項目" in line: continue
-                if line.isdigit() and len(line) < 3:
-                    if current_row:
-                        while len(current_row) < 3: current_row.append("")
-                        group_a.append(current_row)
-                    current_row = [line]
-                elif current_row:
-                    target_idx = 1 if len(current_row) == 1 else 2
-                    if len(current_row) <= target_idx: current_row.append(line)
-                    else: current_row[2] += f"\n{line}"
+                if "項次" in line or "項目" in line or "---" in line: continue
+                if "|" in line:
+                    parts = [p.strip() for p in line.split('|') if p.strip()]
+                    if len(parts) >= 2: group_a.append(parts[:3])
+                else:
+                    if line.isdigit() and len(line) < 3:
+                        if current_row:
+                            while len(current_row) < 3: current_row.append("")
+                            group_a.append(current_row)
+                        current_row = [line]
+                    elif current_row:
+                        target_idx = 1 if len(current_row) == 1 else 2
+                        if len(current_row) <= target_idx: current_row.append(line)
+                        else: current_row[2] += f"\n{line}"
 
-            # 4. Other (增強版：支援 Markdown 表格與星號列表)
+            # 4. Other
             else:
-                # 處理子標題 (一) (二)
+                if "---" in line: continue
                 if line.startswith("(") and ")" in line and len(line) < 15:
                     other.append(("subheader", line, ""))
-                
-                # 處理 Markdown 表格 | A | B |
                 elif "|" in line:
                     parts = [p.strip() for p in line.split('|') if p.strip()]
-                    # 過濾掉分隔線 |---|---|
-                    if len(parts) >= 2 and "---" not in parts[0]:
-                        other.append(("kv", parts[0], parts[1]))
-                
-                # 處理星號列表 * 項目
+                    if len(parts) >= 2: other.append(("kv", parts[0], parts[1]))
                 elif line.startswith("* ") or line.startswith("- "):
-                    # 檢查是不是 Key: Value 格式
                     clean_l = line.replace("* ", "").replace("- ", "")
                     if "：" in clean_l or "=" in clean_l or "≈" in clean_l:
                         for sep in ["：", "=", "≈"]:
@@ -115,8 +132,6 @@ def parse_copilot_final(text):
                                 break
                     else:
                         other.append(("full", line, ""))
-
-                # 處理 Key-Value (一般)
                 elif "：" in line: 
                     parts = line.split("：", 1)
                     other.append(("kv", parts[0], parts[1]))
@@ -126,11 +141,8 @@ def parse_copilot_final(text):
                 elif "=" in line: 
                     parts = line.split("=", 1)
                     other.append(("kv", parts[0].strip(), parts[1].strip()))
-                
-                # 其他純文字
                 else:
-                    if "---" not in line: # 忽略分隔線
-                        other.append(("full", line, ""))
+                    other.append(("full", line, ""))
 
         except Exception:
             continue 
@@ -146,7 +158,6 @@ def parse_copilot_final(text):
 @app.post("/generate_excel")
 async def generate_excel(request: ReportRequest):
     try:
-        # A. 防呆
         if not request.text:
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
@@ -154,10 +165,8 @@ async def generate_excel(request: ReportRequest):
             buffer.seek(0)
             return {"filename": "Error_No_Text.xlsx", "file_content_base64": base64.b64encode(buffer.read()).decode('utf-8')}
 
-        # B. 解析
         pre, fin, grp, oth = parse_copilot_final(request.text)
         
-        # C. 製作 Excel
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             sheet_name = '核保評估表'
@@ -204,7 +213,9 @@ async def generate_excel(request: ReportRequest):
                         safe_write(curr, 0, row[0], cell_fmt)
                         for i in range(1, 5): 
                             val = row[i] if i < len(row) else ""
-                            safe_write(curr, i, val, num_fmt)
+                            # 如果是數字，用 num_fmt，如果是文字(如 N/A)，用 cell_fmt
+                            fmt = num_fmt if str(val).replace(",","").replace(".","").replace("%","").isdigit() else num_fmt
+                            safe_write(curr, i, val, fmt)
                         curr += 1
                     curr += 1
                 except: curr += 1
@@ -252,8 +263,8 @@ async def generate_excel(request: ReportRequest):
                         curr += 1
 
             worksheet.set_column('A:A', 25)
-            worksheet.set_column('B:B', 30)
-            worksheet.set_column('C:E', 15)
+            worksheet.set_column('B:B', 20)
+            worksheet.set_column('C:E', 18)
 
         buffer.seek(0)
         file_base64 = base64.b64encode(buffer.read()).decode('utf-8')
@@ -270,7 +281,6 @@ async def generate_excel(request: ReportRequest):
         }
 
     except Exception as e:
-        # Fallback Error Log
         try:
             err_buffer = io.BytesIO()
             with pd.ExcelWriter(err_buffer, engine='xlsxwriter') as writer:
