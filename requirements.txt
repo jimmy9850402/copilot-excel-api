@@ -2,4 +2,4 @@ fastapi
 uvicorn
 pandas
 xlsxwriter
-python-multipart
+pydantic
