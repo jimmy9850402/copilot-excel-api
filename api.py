@@ -43,8 +43,8 @@ def parse_copilot_final(text):
             section = "finance"; current_row = []; continue
         elif "非財務條件" in line:
             section = "group_a"; current_row = []; continue
-        # 偵測大標題 (例如 3️⃣ 財務評分, 4️⃣ 重大事件, 5️⃣ 總結)
-        elif any(marker in line for marker in ["3️⃣", "4️⃣", "5️⃣", "【Group A", "【核保结论", "【風險評級"]):
+        # 偵測大標題
+        elif any(marker in line for marker in ["3️⃣", "4️⃣", "5️⃣", "【Group A", "【核保結論", "【風險評級", "總結"]):
             section = "other"
             other.append(("header", line, ""))
             continue
@@ -89,31 +89,48 @@ def parse_copilot_final(text):
                     if len(current_row) <= target_idx: current_row.append(line)
                     else: current_row[2] += f"\n{line}"
 
-            # 4. Other (這裡做了大幅增強)
+            # 4. Other (增強版：支援 Markdown 表格與星號列表)
             else:
                 # 處理子標題 (一) (二)
                 if line.startswith("(") and ")" in line and len(line) < 15:
                     other.append(("subheader", line, ""))
                 
-                # 處理條列式 (-)
-                elif line.startswith("- "):
-                    other.append(("full", line, ""))
+                # 處理 Markdown 表格 | A | B |
+                elif "|" in line:
+                    parts = [p.strip() for p in line.split('|') if p.strip()]
+                    # 過濾掉分隔線 |---|---|
+                    if len(parts) >= 2 and "---" not in parts[0]:
+                        other.append(("kv", parts[0], parts[1]))
+                
+                # 處理星號列表 * 項目
+                elif line.startswith("* ") or line.startswith("- "):
+                    # 檢查是不是 Key: Value 格式
+                    clean_l = line.replace("* ", "").replace("- ", "")
+                    if "：" in clean_l or "=" in clean_l or "≈" in clean_l:
+                        for sep in ["：", "=", "≈"]:
+                            if sep in clean_l:
+                                parts = clean_l.split(sep, 1)
+                                val_prefix = "≈ " if sep == "≈" else ""
+                                other.append(("kv", parts[0].strip(), val_prefix + parts[1].strip()))
+                                break
+                    else:
+                        other.append(("full", line, ""))
 
-                # 處理 Key-Value (冒號, 等號, 約等於)
+                # 處理 Key-Value (一般)
                 elif "：" in line: 
                     parts = line.split("：", 1)
                     other.append(("kv", parts[0], parts[1]))
                 elif "≈" in line: 
                     parts = line.split("≈", 1)
-                    # 保留 ≈ 符號在數值端，看起來比較清楚
                     other.append(("kv", parts[0].strip(), "≈ " + parts[1].strip()))
                 elif "=" in line: 
                     parts = line.split("=", 1)
                     other.append(("kv", parts[0].strip(), parts[1].strip()))
                 
-                # 處理其他純文字
+                # 其他純文字
                 else:
-                    other.append(("full", line, ""))
+                    if "---" not in line: # 忽略分隔線
+                        other.append(("full", line, ""))
 
         except Exception:
             continue 
@@ -149,7 +166,7 @@ async def generate_excel(request: ReportRequest):
             
             # 定義樣式
             header_fmt = workbook.add_format({'bold': True, 'fg_color': '#0070C0', 'font_color': 'white', 'border': 1, 'align': 'center', 'valign': 'vcenter'})
-            subheader_fmt = workbook.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1, 'align': 'left'}) # 淺藍色子標題
+            subheader_fmt = workbook.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1, 'align': 'left'}) 
             cell_fmt = workbook.add_format({'border': 1, 'text_wrap': True, 'valign': 'top', 'align': 'left'})
             num_fmt = workbook.add_format({'border': 1, 'align': 'right', 'valign': 'vcenter'})
             section_fmt = workbook.add_format({'bold': True, 'fg_color': '#E0E0E0', 'border': 1})
@@ -158,7 +175,6 @@ async def generate_excel(request: ReportRequest):
 
             curr = 0
             
-            # Helper
             def safe_write(row, col, value, fmt):
                 try: worksheet.write(row, col, str(value), fmt)
                 except: pass
@@ -207,7 +223,7 @@ async def generate_excel(request: ReportRequest):
                     curr += 1
                 except: curr += 1
             
-            # 4. Other (強化的寫入邏輯)
+            # 4. Other
             if oth:
                 for item_type, key, value in oth:
                     try:
@@ -219,7 +235,6 @@ async def generate_excel(request: ReportRequest):
                             except: worksheet.write(curr, 0, key, section_fmt)
                         
                         elif item_type == "subheader": 
-                            # 淺藍色子標題
                             try: worksheet.merge_range(curr, 0, curr, 4, key, subheader_fmt)
                             except: worksheet.write(curr, 0, key, subheader_fmt)
 
@@ -236,12 +251,10 @@ async def generate_excel(request: ReportRequest):
                     except Exception:
                         curr += 1
 
-            # 設定欄寬
-            worksheet.set_column('A:A', 25) # 稍微加寬 A 欄以容納長項目
+            worksheet.set_column('A:A', 25)
             worksheet.set_column('B:B', 30)
             worksheet.set_column('C:E', 15)
 
-        # D. 轉成 Base64 & 檔名處理 (含時間戳記)
         buffer.seek(0)
         file_base64 = base64.b64encode(buffer.read()).decode('utf-8')
         
@@ -257,12 +270,12 @@ async def generate_excel(request: ReportRequest):
         }
 
     except Exception as e:
-        # Error Fallback
+        # Fallback Error Log
         try:
             err_buffer = io.BytesIO()
             with pd.ExcelWriter(err_buffer, engine='xlsxwriter') as writer:
                 ws = writer.book.add_worksheet("Error")
-                ws.write(0, 0, str(e))
+                ws.write(0, 0, "System Error: " + str(e))
             err_buffer.seek(0)
             return {"filename": "Error_Log.xlsx", "file_content_base64": base64.b64encode(err_buffer.read()).decode('utf-8')}
         except:
